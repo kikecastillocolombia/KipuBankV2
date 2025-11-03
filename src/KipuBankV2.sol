@@ -1,144 +1,243 @@
-```markdown
-# KipuBankV2
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
-> Versión mejorada del contrato KipuBank: control de acceso, Chainlink oracle, mappings anidados, constantes e utilidades de conversión.
+/**
+ * @title KipuBankV2
+ * @author Solidity Developer
+ * @notice Vault-like contract for native ETH deposits with role-based access control, Chainlink price feed,
+ *         nested balances (multi-asset ready), constants and conversion utilities.
+ * @dev Uses Checks-Effects-Interactions, custom errors and OpenZeppelin AccessControl.
+ *
+ * NOTE: To verify on Etherscan, use a flattened file (Remix -> File -> Flatten) before pasting into Etherscan verify UI.
+ */
 
----
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-## ✅ Resumen a alto nivel
+/// -----------------------------------------------------------------------
+/// --------------------------- Custom Errors ------------------------------
+/// -----------------------------------------------------------------------
+error NotOwner();
+error DepositExceedsBankCap(uint256 requested, uint256 cap);
+error WithdrawalExceedsThreshold(uint256 requested, uint256 threshold);
+error InsufficientBalance(uint256 available, uint256 requested);
+error InvalidPriceFeed();
+error TransferFailed(address to, uint256 amount);
 
-`KipuBankV2` es una evolución del contrato `KipuBank` pensada para producción temprana / entornos de testing avanzado. Las mejoras clave:
+/// -----------------------------------------------------------------------
+/// ---------------------------- KipuBankV2 --------------------------------
+/// -----------------------------------------------------------------------
+contract KipuBankV2 is AccessControl {
+    // -----------------------------
+    // Roles
+    // -----------------------------
+    bytes32 public constant BANK_ADMIN_ROLE = keccak256("BANK_ADMIN_ROLE");
 
-- **Control de Acceso:** `AccessControl` de OpenZeppelin para roles (ADMIN, BANK_ADMIN), separación de permisos.
-- **Declaraciones de Tipos:** `enum` + `struct` para mejorar claridad y tipado (p. ej. `AssetType`, `Stats`).
-- **Instancia Chainlink:** `AggregatorV3Interface` para obtener precio ETH/USD y convertir valores.
-- **Variables `constant` y `immutable`:** reducción de gas y mejores garantías inmutables (bankCap, thresholds).
-- **Mappings anidados:** `mapping(address => mapping(address => uint256)) balances` soporta multi-asset (address(0) = ETH).
-- **Funciones de conversión:** `convertEthToUsd`, `convertUsdToEth` para trabajar con precios del oráculo.
-- **Patrón Checks-Effects-Interactions:** usado en deposit/withdraw y seguridad general.
-- **Eventos y errores personalizados:** para trazabilidad y gas optimizado.
+    // -----------------------------
+    // Types
+    // -----------------------------
+    /// @notice Type to identify the asset slot. address(0) == native ETH.
+    enum AssetType { NATIVE, ERC20 }
 
-### Por qué estas mejoras
-- **Seguridad:** roles permiten operaciones administrativas solo por cuentas autorizadas. Checks-Effects-Interactions y errores personalizados reducen vectores de ataque.
-- **Comodidad:** conversiones con Oráculo permiten exponer valor en USD, útil para UX o límites basados en fiat.
-- **Escalabilidad:** mappings anidados permiten añadir tokens ERC20 en el futuro sin rehacer estado.
+    /// @notice Struct for global statistics
+    struct Stats {
+        uint256 totalDeposits;
+        uint256 totalWithdrawals;
+        uint256 totalValueLockedWei;
+    }
 
----
+    // -----------------------------
+    // Constants / Immutables
+    // -----------------------------
+    /// @notice Number of decimals generally used for ETH (wei precision).
+    uint8 public constant ETH_DECIMALS = 18;
 
-## Estructura del repositorio (sugerida)
+    /// @notice Chainlink ETH / USD price feed (Sepolia). Replace with network-specific address if needed.
+    AggregatorV3Interface public constant PRICE_FEED =
+        AggregatorV3Interface(0x694AA1769357215DE4FAC081bf1f309aDC325306);
 
-```
+    /// @notice Global maximum the bank can hold (wei)
+    uint256 public immutable bankCapWei;
 
-KipuBankV2/
-├─ src/
-│  └─ KipuBankV2.sol
-├─ README.md
-└─ LICENSE
+    /// @notice Max withdrawal per transaction (wei)
+    uint256 public immutable maxWithdrawalThresholdWei;
 
-````
+    // -----------------------------
+    // Storage
+    // -----------------------------
+    /// @notice balances[user][assetAddress] where assetAddress == address(0) means native ETH
+    mapping(address => mapping(address => uint256)) public balances;
 
----
+    /// @notice per-user deposit count (example of nested mapping usage if needed later)
+    mapping(address => uint256) public userDepositCount;
 
-## Archivo principal
+    /// @notice Global stats
+    Stats public stats;
 
-`src/KipuBankV2.sol` — contiene el contrato explicado arriba. Usa:
-- `pragma solidity ^0.8.20`
-- `OpenZeppelin AccessControl` (import)
-- `Chainlink AggregatorV3Interface` (import)
+    /// @notice Owner (deployer) convenience view
+    address public immutable deployer;
 
-> **Nota:** Para verificar en Etherscan usa el archivo **flattened** (Remix -> Flatten) ya que el verificador no resuelve imports remotos directamente.
+    // -----------------------------
+    // Events
+    // -----------------------------
+    event Deposit(address indexed user, address indexed asset, uint256 amountWei, uint256 newBalanceWei);
+    event Withdrawal(address indexed user, address indexed asset, uint256 amountWei, uint256 newBalanceWei);
+    event AdminWithdraw(address indexed admin, address indexed recipient, uint256 amountWei);
 
----
+    // -----------------------------
+    // Constructor
+    // -----------------------------
+    /**
+     * @param _bankCapWei Maximum wei the contract may hold.
+     * @param _maxWithdrawalThresholdWei Maximum wei per withdrawal.
+     */
+    constructor(uint256 _bankCapWei, uint256 _maxWithdrawalThresholdWei) {
+        bankCapWei = _bankCapWei;
+        maxWithdrawalThresholdWei = _maxWithdrawalThresholdWei;
+        deployer = msg.sender;
 
-## Despliegue en Sepolia (Remix + MetaMask) — paso a paso (principiante)
+        // Grant roles
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(BANK_ADMIN_ROLE, msg.sender);
+    }
 
-### Requisitos
-- MetaMask con Sepolia activa
-- ETH de prueba en Sepolia (faucet)
-- Remix: https://remix.ethereum.org
+    // -----------------------------
+    // Modifiers
+    // -----------------------------
+    modifier onlyAdmin() {
+        if (!hasRole(BANK_ADMIN_ROLE, msg.sender)) revert NotOwner();
+        _;
+    }
 
-### 1) Abrir Remix y crear archivo
-- En el File Explorer de Remix crea `src/KipuBankV2.sol` y pega el contenido del contrato.
+    // -----------------------------
+    // Public / External Functions
+    // -----------------------------
 
-### 2) Compilar
-- Abrir la pestaña **Solidity Compiler**.
-- Seleccionar versión **0.8.20** (o la que figure en el pragma).
-- Activar **Enable optimization** (Runs = 200).
-- Compilar.
+    /**
+     * @notice Deposit native ETH to caller's vault.
+     * @dev Checks the global bank cap before accepting deposit. Uses Checks-Effects-Interactions.
+     */
+    function deposit() external payable {
+        uint256 incoming = msg.value;
+        // 1) Checks
+        uint256 newBalanceContract = address(this).balance;
+        if (newBalanceContract > bankCapWei) revert DepositExceedsBankCap(newBalanceContract, bankCapWei);
 
-### 3) Conectar MetaMask
-- En **Deploy & Run Transactions** elegir **Injected Provider - MetaMask**.
-- Confirmar que MetaMask está en **Sepolia**.
+        // 2) Effects
+        balances[msg.sender][address(0)] += incoming; // nested mapping: user -> assetAddress (0 = ETH)
+        userDepositCount[msg.sender] += 1;
+        unchecked { stats.totalDeposits += 1; stats.totalValueLockedWei += incoming; }
 
-### 4) Desplegar
-- En los parámetros del constructor, usa (ejemplo):
-  - `bankCapWei`: `10000000000000000000` (10 ETH)
-  - `maxWithdrawalThresholdWei`: `1000000000000000000` (1 ETH)
-- Haz click en **Deploy** y confirma en MetaMask.
-- Copia la dirección del contrato desplegado.
+        // 3) Interactions (none needed — funds are already on contract)
+        emit Deposit(msg.sender, address(0), incoming, balances[msg.sender][address(0)]);
+    }
 
-### 5) Verificar en Etherscan (Sepolia)
-- En Remix: Archivo -> `Flatten` para obtener un solo archivo que contenga todas las dependencias.
-- Ve a `https://sepolia.etherscan.io/verifyContract`.
-- Elige:
-  - Compiler type: `Solidity (Single file)`
-  - Compiler version: `v0.8.20+commit...` (la misma que usaste)
-  - Optimization: `Yes` (200 runs)
-- Pega el código flatten y completa la verificación.
+    /**
+     * @notice Withdraw native ETH from caller's vault.
+     * @param amountWei Amount in wei to withdraw.
+     * @dev Follows Checks-Effects-Interactions pattern and enforces per-tx threshold.
+     */
+    function withdraw(uint256 amountWei) external {
+        // 1) Checks
+        if (amountWei > maxWithdrawalThresholdWei) revert WithdrawalExceedsThreshold(amountWei, maxWithdrawalThresholdWei);
+        uint256 userBal = balances[msg.sender][address(0)];
+        if (userBal < amountWei) revert InsufficientBalance(userBal, amountWei);
 
-> Si Etherscan devuelve error `Source not found` o `ParserError`, asegúrate de usar **flatten** y copiar exactamente el contenido flattened.
+        // 2) Effects
+        balances[msg.sender][address(0)] = userBal - amountWei;
+        unchecked { stats.totalWithdrawals += 1; stats.totalValueLockedWei -= amountWei; }
 
----
+        // 3) Interactions
+        (bool ok, ) = payable(msg.sender).call{value: amountWei}("");
+        if (!ok) revert TransferFailed(msg.sender, amountWei);
 
-## Interacción básica (Remix)
+        emit Withdrawal(msg.sender, address(0), amountWei, balances[msg.sender][address(0)]);
+    }
 
-- `deposit()` — enviar ETH con el **Value** en Remix y llamar a la función (guarda ETH en `balances[msg.sender][address(0)]`).
-- `withdraw(uint256 amountWei)` — retirar hasta `maxWithdrawalThresholdWei`.
-- `getBalance(address user, address asset)` — consultar balance (address(0) para native).
-- `convertEthToUsd(uint256 ethAmountWei)` — obtener USD (8 decimales) para el monto.
-- `getLatestEthUsdPrice()` — devuelve precio de Chainlink (8 decimales usualmente).
+    /**
+     * @notice Admin emergency withdraw to a safe address (only admin).
+     * @dev This function is gated by BANK_ADMIN_ROLE, used for emergency recovery only.
+     * @param recipient Address to receive ETH.
+     * @param amountWei Amount in wei to send.
+     */
+    function adminWithdraw(address payable recipient, uint256 amountWei) external onlyAdmin {
+        require(recipient != address(0), "zero recipient");
+        uint256 contractBal = address(this).balance;
+        require(amountWei <= contractBal, "not enough contract balance");
 
----
+        unchecked { stats.totalValueLockedWei -= amountWei; }
+        (bool ok, ) = recipient.call{value: amountWei}("");
+        if (!ok) revert TransferFailed(recipient, amountWei);
 
-## Notas de diseño / Trade-offs
+        emit AdminWithdraw(msg.sender, recipient, amountWei);
+    }
 
-- **Oracle dependencia:** usar Chainlink mejora exactitud de precios pero añade dependencia externa (si la feed falla/stop de oráculo, las funciones que dependen de precio revertirán).
-- **Bank cap (global):** límite útil en testnet/mainnet para minimizar exposición, pero impone un techo que puede necesitar ser actualizado por diseño (no hay función para mutarlo; si la quieres añadir, hazlo con `onlyAdmin` y eventos).
-- **Admin withdrawal:** se incluyó una función `adminWithdraw` para emergencias. Esto es una BACKDOOR potencial — debe usarse con cuidado y documentarse claramente en governance.
-- **ERC20 soporte futuro:** mappings anidados están listos para ERC20, pero no se incluyen funciones ERC20 (permit/transferFrom) en esta versión; añadir soporte requiere SafeERC20 y validaciones.
+    // -----------------------------
+    // View / Utility Functions
+    // -----------------------------
 
----
+    /**
+     * @notice Get user's balance for a given asset address.
+     * @param user Address of the user.
+     * @param asset Address of the asset; address(0) == native ETH.
+     * @return Balance in wei (for native) or token's smallest unit for ERC20s.
+     */
+    function getBalance(address user, address asset) external view returns (uint256) {
+        return balances[user][asset];
+    }
 
-## Verificación / Transparencia
-> Añade aquí la **dirección del contrato desplegado** y el enlace a Etherscan después de desplegar y verificar:
+    /**
+     * @notice Convert an ETH amount (wei) to USD using Chainlink price feed.
+     * @param ethAmountWei Amount in wei to convert.
+     * @return usdAmountWith8Decimals USD value scaled to 8 decimals (Chainlink price has 8 decimals on many feeds).
+     * @dev Price feeds commonly return price with 8 decimals (e.g., 3000.12345678 USD => 300012345678).
+     */
+    function convertEthToUsd(uint256 ethAmountWei) public view returns (uint256 usdAmountWith8Decimals) {
+        (, int256 price, , , ) = PRICE_FEED.latestRoundData();
+        if (price <= 0) revert InvalidPriceFeed();
 
-- **Dirección del contrato (Sepolia):** `PASTE_CONTRACT_ADDRESS_HERE`
-- **Etherscan (verify) URL:** `https://sepolia.etherscan.io/address/PASTE_CONTRACT_ADDRESS_HERE#code`
+        // price has 8 decimals, ethAmountWei has 18 decimals.
+        // usd = ethAmountWei * price / 1e18
+        usdAmountWith8Decimals = (ethAmountWei * uint256(price)) / (10 ** uint256(ETH_DECIMALS));
+    }
 
----
+    /**
+     * @notice Convert an USD amount (8 decimals) to an approximate ETH amount (wei).
+     * @param usdAmountWith8Decimals USD amount scaled to 8 decimals.
+     * @return ethAmountWei Approximate wei for the given USD value.
+     */
+    function convertUsdToEth(uint256 usdAmountWith8Decimals) external view returns (uint256 ethAmountWei) {
+        (, int256 price, , , ) = PRICE_FEED.latestRoundData();
+        if (price <= 0) revert InvalidPriceFeed();
 
-## Cómo publicar en GitHub (rápido)
+        // eth wei = usd * 1e18 / price
+        ethAmountWei = (usdAmountWith8Decimals * (10 ** uint256(ETH_DECIMALS))) / uint256(price);
+    }
 
-```bash
-git init
-git add .
-git commit -m "KipuBankV2: initial smart contract & README"
-gh repo create KipuBankV2 --public --source=. --remote=origin --push
-````
+    /**
+     * @notice Returns latest ETH/USD price from the feed (8 decimals).
+     */
+    function getLatestEthUsdPrice() external view returns (int256) {
+        (, int256 price, , , ) = PRICE_FEED.latestRoundData();
+        return price;
+    }
 
-(O usa la UI de GitHub para crear el repo y empuja tu código).
+    // -----------------------------
+    // Fallback / Receive
+    // -----------------------------
+    receive() external payable {
+        // Accept ETH transfers — treat them as deposits for sender (explicit deposit recommended).
+        balances[msg.sender][address(0)] += msg.value;
+        unchecked { stats.totalDeposits += 1; stats.totalValueLockedWei += msg.value; }
+        emit Deposit(msg.sender, address(0), msg.value, balances[msg.sender][address(0)]);
+    }
 
----
-
-## Licencia
-
-MIT
-
----
-
-## Soporte
-
-Si quieres que **yo** genere el archivo *flattened* listo para pegar en Etherscan (basado en el código que te entregué) o que adapte el contrato para añadir funciones ERC20, admin-upgradeable cap, o integración con Hardhat/Foundry, dime y te lo preparo.
-
-```
-```
+    fallback() external payable {
+        // If calldata present, ignore but accept ETH.
+        if (msg.value > 0) {
+            balances[msg.sender][address(0)] += msg.value;
+            unchecked { stats.totalDeposits += 1; stats.totalValueLockedWei += msg.value; }
+            emit Deposit(msg.sender, address(0), msg.value, balances[msg.sender][address(0)]);
+        }
+    }
+}
